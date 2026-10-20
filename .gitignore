@@ -1,3 +1,28 @@
+# Editor and OS artifacts
 *.bak
 *~
 *.swp
+*.swo
+.*.kate-swp
+.directory
+
+# Never in this repo: model weights
+*.gguf
+*.safetensors
+*.bin
+
+# Never in this repo: secrets
+*.key
+*.pem
+*api-key*
+*.env
+!versions.env.example
+
+# Local test output (snapshots, benchmark dumps)
+etc-snapshot-*
+*.log
+/out/
+
+# Python tooling (e.g. a local gguf venv)
+.venv/
+__pycache__/
