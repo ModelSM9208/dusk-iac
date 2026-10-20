@@ -25,13 +25,16 @@ a purge from zero, a re-pull by digest returning the same image, and a cold boot
 4. **Nothing persistent and writable feeds the next start.** Digest-pinned image with
    `Pull=never`, read-only root filesystem, read-only weights (on the host *and* in
    the container), read-only key file.
-5. **One lifecycle, six scripts.** Bootstrap, install, verify; teardown, verify-absent;
-   and an `/etc` snapshot for proving teardown leaves nothing behind.
+5. **One lifecycle, seven scripts.** Bootstrap, install, verify; teardown, verify-absent;
+   an `/etc` snapshot for proving teardown leaves nothing behind; and a benchmark.
+6. **Models are per-host profiles.** `hosts/<host>/models/*.conf` holds one complete
+   bundle per model (file, offload, context, cache, load mode); a symlink selects one.
 
 ```bash
 sudo scripts/bootstrap-bazzite.sh          # one-time host prep (idempotent)
 sudo scripts/install-bazzite.sh            # deploy repo -> host
 sudo tests/verify.sh                       # 13 checks
+sudo tests/speedtest.sh                    # prefill/decode on a fixed ~3.3k-token prompt
 sudo scripts/teardown-bazzite.sh [--purge] # undeploy, or back to before bootstrap
 sudo tests/verify-absent.sh [--purge]      # prove nothing is left
 ```
@@ -40,8 +43,9 @@ End state on `xtx`:
 
 ```
 13/13 checks after a cold boot, with no login as dusk
-Qwen3-VL-4B-Instruct Q4_K_M at 8k context:
-  3.58 GB VRAM, 143-162 tok/s decode, load 1.3 s (warm page cache) / ~22 s (cold, gigabit NFS)
+60B-A3B MoE (Qwen3-MoE arch, 48 layers, 256 experts / 8 active), Q4_K_S, ~31.6 GiB:
+  24k context, experts of 20 layers in RAM, V cache q8_0, load-mode none
+  964 tok/s prefill / 25.8 tok/s decode (steady state), 21.74 GiB VRAM, ~13 GiB RAM
 ```
 
 ---
@@ -54,7 +58,9 @@ Qwen3-VL-4B-Instruct Q4_K_M at 8k context:
 | GPU | AMD Radeon RX 7900 XTX (gfx1100, RDNA3) at PCI `0000:0e:00.0` |
 | Runtime | rootless Podman, `crun`, Quadlet |
 | Image | `ghcr.io/ggml-org/llama.cpp:server-vulkan`, pinned by digest (pulled 2026-10-19). Authoritative value: `Image=` in `base/llama-dusk.container` |
-| Model (smoke) | `Qwen/Qwen3-VL-4B-Instruct-GGUF`, `Qwen3VL-4B-Instruct-Q4_K_M.gguf`, text side only (no `--mmproj`). Commit not yet pinned |
+| Model (smoke) | `Qwen/Qwen3-VL-4B-Instruct-GGUF`, `Qwen3VL-4B-Instruct-Q4_K_M.gguf`, text side only (no `--mmproj`). Commit not yet pinned. Profile: `hosts/xtx/models/qwen3vl-4b.conf` |
+| Model (tuning) | Community 60B-A3B MoE fine-tune, Q4_K_S imatrix quant. Test model only: third-party merge, not a publisher release. Profile: `hosts/xtx/models/moe-60b-a3b-q4ks.conf` |
+| Host memory | 62.7 GiB RAM, 16 GiB swap on zram (compressed RAM, not disk) |
 | Model store | NFSv4.2 `192.168.2.188:/mnt/array/AIModels` mounted read-only at `/var/mnt/duskmodels` |
 | Service identity | `dusk`: no login shell, member of `render` only |
 | Endpoint | `http://127.0.0.1:8080/v1`, OpenAI-compatible; API key required on inference endpoints |
@@ -115,7 +121,10 @@ dusk-iac/
 │   └── xtx/
 │       ├── 70-dusk-gpu.rules                  # creates /dev/dri/dusk-render from the PCI address
 │       ├── llama-dusk.container.d/
-│       │   └── 20-model.conf                  # which model, and the sizing that fits this card
+│       │   └── 20-model.conf -> ../models/…   # symlink: selects the active profile
+│       ├── models/
+│       │   ├── qwen3vl-4b.conf                # smoke-test profile
+│       │   └── moe-60b-a3b-q4ks.conf          # tuned MoE profile
 │       └── var-mnt-duskmodels.mount           # read-only, container-labelled NFS model store
 ├── node/                                      # Butane, for the CoreOS appliance (later)
 ├── scripts/
@@ -125,7 +134,8 @@ dusk-iac/
 ├── tests/
 │   ├── verify.sh                              # 13 post-deploy checks
 │   ├── verify-absent.sh                       # post-teardown checks
-│   └── etc-snapshot.sh                        # content snapshot of /etc drift vs the image
+│   ├── etc-snapshot.sh                        # content snapshot of /etc drift vs the image
+│   └── speedtest.sh                           # prefill/decode benchmark, timings from its own response
 └── docs/
     └── BUILD.md                               # this file
 ```
@@ -136,8 +146,9 @@ dusk-iac/
 
 - **A GPU at `/dev/dri/dusk-render`.** Each host's udev rule creates it from that
   host's PCI address. The host's kernel can renumber render nodes; the name stays fixed.
-- **A model at `/models/model.gguf`, plus its sizing.** Each host's drop-in supplies the
-  `Volume=` line and the `LLAMA_ARG_*` sizing variables.
+- **A model at `/models/model.gguf`, plus its sizing.** Each host's active profile
+  (reached through the `20-model.conf` symlink) supplies the `Volume=` line and the
+  `LLAMA_ARG_*` runtime settings. See [Model profiles and tuning](#model-profiles-and-tuning).
 
 A new machine is a new `hosts/<name>/` directory and a `HOST=` change in
 `install-bazzite.sh` and `verify.sh`. `base/` is not edited. See [Adding a host](#adding-a-host).
@@ -255,14 +266,29 @@ Never edit the copies under `/etc`: the next deploy replaces them.
    GGUF is not pickle, but it is untrusted input to a C++ parser that has had
    vulnerabilities: official source, pinned commit, checked hash, read-only mount.
 2. **Do the memory arithmetic** before deploying: weights + KV cache at the chosen
-   context + compute buffers must fit in free VRAM. With the desktop running, about
-   1.7 GB of the 24 GB card is already in use.
-3. **Edit `hosts/xtx/llama-dusk.container.d/20-model.conf`:** the `Volume=` source path,
-   `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_GPU_LAYERS`, and the provenance comment
-   (source, commit, file hash).
-4. **Deploy and verify.** The context check reads its expected value from the drop-in,
-   so it follows the change automatically.
+   context + compute buffers must fit in free VRAM (or VRAM + RAM, for an MoE with
+   experts offloaded). With the desktop running, about 1.7 GB of the 24 GB card is
+   already in use. The [sizing formulas](#sizing-on-paper-first) do this on paper.
+3. **Write a profile** in `hosts/xtx/models/<name>.conf`, starting from a copy of an
+   existing one: the `Volume=` source path, the runtime settings, and the provenance
+   comment (source, commit, file hash). Redo the sizing; never carry it over.
+4. **Select it, commit, deploy, verify:**
+
+   ```bash
+   cd ~/git/dusk-iac/hosts/xtx
+   ln -sfn ../models/<name>.conf llama-dusk.container.d/20-model.conf
+   cd ~/git/dusk-iac && git add -A && git commit -m "model: <name>"
+   sudo scripts/install-bazzite.sh
+   sudo tests/verify.sh && sudo tests/speedtest.sh
+   ```
+
+   The context check reads its expected value through the symlink, so it follows the
+   change automatically. On a large model over NFS, the 3-minute health wait in
+   `verify.sh` can expire: rerun it once `/health` says `ok`.
 5. **Measure placement from the kernel,** not the logs. See [Measuring](#measuring-where-memory-went).
+
+Never put two profiles inside `llama-dusk.container.d/`. Quadlet merges every `.conf`
+there, and two `Volume=` lines would both mount onto `/models/model.gguf`.
 
 ### Tearing down
 
@@ -411,6 +437,35 @@ sudo systemctl --user -M dusk@ start llama-dusk.service
 
 Measured on `xtx` with the 4B smoke model at 8k context: VRAM 5.27 → 1.70 GB
 (**3.58 GB freed**), GTT 927 → 291 MB (staging only).
+
+---
+
+## Model profiles and tuning
+
+### Why profiles live under `hosts/`
+
+Everything in a profile is a runtime setting, and the right value depends on the host's
+VRAM and RAM as much as on the model. The model file is portable; its tuning isn't.
+So `hosts/<host>/models/<model>.conf` is per host *and* per model: the same 60B MoE on
+a 128 GB unified-memory machine would need no expert offload at all.
+
+The base unit holds only what is true everywhere: image, security settings, port, key,
+model path. Profiles never use `Exec=`, and the base `Exec=` carries no model-specific
+flags, because command-line flags override environment variables and would silently
+defeat every profile.
+
+### The settings, all confirmed against the pinned image's `--help`
+
+| Variable | Flag | Does |
+|---|---|---|
+| `LLAMA_ARG_N_GPU_LAYERS` | `-ngl` | Layers stored in VRAM: a number, `auto` (the build's default) or `all` |
+| `LLAMA_ARG_CTX_SIZE` | `-c` | Context size in tokens. Always set it: unset, recent builds use the model's full trained context |
+| `LLAMA_ARG_CPU_MOE` | `-cmoe` | All MoE expert weights in RAM |
+| `LLAMA_ARG_N_CPU_MOE` | `-ncmoe N` | Expert weights of the **first N layers** in RAM, the rest on the GPU |
+| `LLAMA_ARG_MOE_CACHE_MIB` | `--moe-cache-mib` | GPU cache for RAM-resident experts (default 0, off). Untested |
+| `LLAMA_ARG_CACHE_TYPE_K` / `_V` | `-ctk` / `-ctv` | KV cache data type: f16 (default), bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, f32 |
+| `LLAMA_ARG_FLASH_ATTN` | `-fa` | `on`, `off`, `auto` (default). Quantizing the V cache depends on it |
+| `LLAMA_ARG_LOAD_MODE` | `-lm` | `auto` (mmap where supported), `none`, `mmap`, `mlock`, `mmap+mlock`, `dio` |
 
 ---
 
@@ -644,7 +699,7 @@ Last verified : 2026-10-20  done-stamp cycle A–E passed, including cold boot
 Host          : xtx, Bazzite (ghcr.io/ublue-os/bazzite-dx:stable)
 Image         : ghcr.io/ggml-org/llama.cpp:server-vulkan
                 @sha256:fa677644887843555b844fdcdb8756c7bae39ddb03db25e83c3d5f3472bd3a10
-Model         : Qwen3-VL-4B-Instruct Q4_K_M (smoke test)
+Model         : 60B-A3B MoE Q4_K_S (tuning test); Qwen3-VL-4B Q4_K_M (smoke test)
 GPU           : Radeon RX 7900 XTX (gfx1100) at 0000:0e:00.0
 ```
 
