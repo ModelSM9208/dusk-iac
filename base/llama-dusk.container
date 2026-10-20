@@ -1,0 +1,31 @@
+# Agent Dusk inference server. Host-agnostic.
+#   model + sizing -> hosts/<host>/llama-dusk.container.d/*.conf
+#   GPU            -> hosts/<host>/70-dusk-gpu.rules must create /dev/dri/dusk-render
+# Image: ghcr.io/ggml-org/llama.cpp:server-vulkan, pinned 2026-10-19
+
+[Unit]
+Description=Agent Dusk inference (llama.cpp / Vulkan)
+
+[Container]
+ContainerName=llama-dusk
+Image=ghcr.io/ggml-org/llama.cpp@sha256:fa677644887843555b844fdcdb8756c7bae39ddb03db25e83c3d5f3472bd3a10
+Pull=never
+
+AddDevice=/dev/dri/dusk-render:/dev/dri/renderD128
+GroupAdd=keep-groups
+DropCapability=all
+NoNewPrivileges=true
+ReadOnly=true
+
+PublishPort=127.0.0.1:8080:8080
+Secret=dusk-api-key,type=mount,target=/run/secrets/dusk-api-key,mode=0400
+Environment=LLAMA_ARG_API_KEY_FILE=/run/secrets/dusk-api-key
+
+Exec=-m /models/model.gguf --host 0.0.0.0 --port 8080
+
+[Service]
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

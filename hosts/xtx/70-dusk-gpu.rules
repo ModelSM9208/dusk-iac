@@ -1,0 +1,2 @@
+# xtx: RX 7900 XTX at PCI 0000:0e:00.0 -> /dev/dri/dusk-render (the name base/ expects)
+SUBSYSTEM=="drm", KERNEL=="renderD*", KERNELS=="0000:0e:00.0", SYMLINK+="dri/dusk-render"

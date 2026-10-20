@@ -1,0 +1,13 @@
+[Unit]
+Description=Dusk model store (NFS, read-only)
+Wants=network-online.target
+After=network-online.target
+
+[Mount]
+What=192.168.2.188:/mnt/array/AIModels
+Where=/var/mnt/duskmodels
+Type=nfs4
+Options=ro,nosuid,nodev,noexec,nosharecache,context=system_u:object_r:container_file_t:s0
+
+[Install]
+WantedBy=remote-fs.target
